@@ -26,10 +26,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <protocol.h>
-#include <robot_ctrl.h>
+#include <chassis.h>
 #include "pid.h"
 #include "encoder.h"
 #include "motor.h"
+#include <math.h>
+#include "mpu6050.h"
+#include "kinematics.h"
+#include "odometry.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -48,6 +52,8 @@ uint8_t rx_data;
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+I2C_HandleTypeDef hi2c2;
+
 TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim3;
 TIM_HandleTypeDef htim4;
@@ -61,23 +67,26 @@ const osThreadAttr_t Task_Comm_attributes = {
   .stack_size = 256 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
-/* Definitions for Tack_Motor */
-osThreadId_t Tack_MotorHandle;
-const osThreadAttr_t Tack_Motor_attributes = {
-  .name = "Tack_Motor",
+/* Definitions for Task_Chassis */
+osThreadId_t Task_ChassisHandle;
+const osThreadAttr_t Task_Chassis_attributes = {
+  .name = "Task_Chassis",
   .stack_size = 256 * 4,
   .priority = (osPriority_t) osPriorityHigh,
 };
+/* Definitions for Task_System */
+osThreadId_t Task_SystemHandle;
+const osThreadAttr_t Task_System_attributes = {
+  .name = "Task_System",
+  .stack_size = 256 * 4,
+  .priority = (osPriority_t) osPriorityLow,
+};
 /* USER CODE BEGIN PV */
-//#define RX_BUFFER_SIZE 128
-//uint8_t rx_byte;               // 临时存接收到的 1 个字节
-//uint8_t rx_buffer[RX_BUFFER_SIZE]; // 存整个 JSON 字符串的数组
-//uint16_t rx_index = 0;         // 数组下标
-//uint8_t json_received_flag = 0; // 标志位：1表示收到完整的一包
-PID_TypeDef PID_Motor1;
-PID_TypeDef PID_Motor2;
-float Target_Speed_L = 50.0f; // 左轮目标速度
-float Target_Speed_R = 50.0f; // 右轮目标速度
+volatile float User_Target_Linear_X = 0.0f;  // 目标线速度
+volatile float User_Target_Angular_Z = 0.0f; // 目标角速度
+
+PID_TypeDef PID_MotorL; 
+PID_TypeDef PID_MotorR;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -87,8 +96,10 @@ static void MX_TIM2_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_TIM3_Init(void);
 static void MX_TIM4_Init(void);
-void Task_Comm01(void *argument);
-void Tack_Motor00(void *argument);
+static void MX_I2C2_Init(void);
+void Comm_Task_Entry(void *argument);
+void Chassis_Task_Entry(void *argument);
+void System_Task_Entry(void *argument);
 
 /* USER CODE BEGIN PFP */
 
@@ -101,16 +112,14 @@ void Tack_Motor00(void *argument);
 
 void On_Receive_Velocity(float x, float z)
 {
-    // 1. 视觉验证：每次收到指令，翻转一次 LED 状态
-    // 如果你狂发指令，这个灯就会狂闪
     HAL_GPIO_TogglePin(LED_PORT, LED_PIN);
 
-    // 2. 数据回显验证 (Echo Test)
-    // 既然没有电机，我们就假装当前的“里程计数据”就是刚才收到的“目标速度”
-    // 这样香橙派发什么，应该就能立刻收到什么
     Protocol_Send_Odom(x, z); 
-}
+	//Chassis_Set_Velocity(x, z);
+	User_Target_Linear_X = x;
+    User_Target_Angular_Z = z;
 
+}
 /* USER CODE END 0 */
 
 /**
@@ -121,7 +130,7 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-
+  
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -146,12 +155,24 @@ int main(void)
   MX_USART1_UART_Init();
   MX_TIM3_Init();
   MX_TIM4_Init();
+  MX_I2C2_Init();
   /* USER CODE BEGIN 2 */
+  
   // 启动 TIM2 的 Channel 1
   HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
   // 开启中断接收，每收到 1 个字节，就进一次中断回调函数
   HAL_UART_Receive_IT(&huart1, &rx_data, 1);
-  Robot_Init();
+  HAL_TIM_Base_Start_IT(&htim2);
+  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
+  // 开启编码器计数
+  Encoder_Init(); // 内部开启了 TIM3, TIM4
+  // 开启 PWM (TIM2/TIM1)
+  Motor_Init(); // 内部调用了 HAL_TIM_PWM_Start(&htim1...)
+  // 开启串口接收
+  HAL_UART_Receive_IT(&huart1, &rx_data, 1);
+  MPU_Init();
+  MPU_Calibrate();
   /* USER CODE END 2 */
 
   /* Init scheduler */
@@ -175,10 +196,13 @@ int main(void)
 
   /* Create the thread(s) */
   /* creation of Task_Comm */
-  Task_CommHandle = osThreadNew(Task_Comm01, NULL, &Task_Comm_attributes);
+  Task_CommHandle = osThreadNew(Comm_Task_Entry, NULL, &Task_Comm_attributes);
 
-  /* creation of Tack_Motor */
-  Tack_MotorHandle = osThreadNew(Tack_Motor00, NULL, &Tack_Motor_attributes);
+  /* creation of Task_Chassis */
+  Task_ChassisHandle = osThreadNew(Chassis_Task_Entry, NULL, &Task_Chassis_attributes);
+
+  /* creation of Task_System */
+  Task_SystemHandle = osThreadNew(System_Task_Entry, NULL, &Task_System_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
@@ -241,6 +265,40 @@ void SystemClock_Config(void)
 }
 
 /**
+  * @brief I2C2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_I2C2_Init(void)
+{
+
+  /* USER CODE BEGIN I2C2_Init 0 */
+
+  /* USER CODE END I2C2_Init 0 */
+
+  /* USER CODE BEGIN I2C2_Init 1 */
+
+  /* USER CODE END I2C2_Init 1 */
+  hi2c2.Instance = I2C2;
+  hi2c2.Init.ClockSpeed = 100000;
+  hi2c2.Init.DutyCycle = I2C_DUTYCYCLE_2;
+  hi2c2.Init.OwnAddress1 = 0;
+  hi2c2.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c2.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c2.Init.OwnAddress2 = 0;
+  hi2c2.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c2.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2C2_Init 2 */
+
+  /* USER CODE END I2C2_Init 2 */
+
+}
+
+/**
   * @brief TIM2 Initialization Function
   * @param None
   * @retval None
@@ -252,7 +310,6 @@ static void MX_TIM2_Init(void)
 
   /* USER CODE END TIM2_Init 0 */
 
-  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
   TIM_MasterConfigTypeDef sMasterConfig = {0};
   TIM_OC_InitTypeDef sConfigOC = {0};
 
@@ -265,15 +322,6 @@ static void MX_TIM2_Init(void)
   htim2.Init.Period = 3599;
   htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
-  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
   if (HAL_TIM_PWM_Init(&htim2) != HAL_OK)
   {
     Error_Handler();
@@ -327,11 +375,11 @@ static void MX_TIM3_Init(void)
   htim3.Init.Period = 65535;
   htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  sConfig.EncoderMode = TIM_ENCODERMODE_TI12;
+  sConfig.EncoderMode = TIM_ENCODERMODE_TI1;
   sConfig.IC1Polarity = TIM_ICPOLARITY_RISING;
   sConfig.IC1Selection = TIM_ICSELECTION_DIRECTTI;
   sConfig.IC1Prescaler = TIM_ICPSC_DIV1;
-  sConfig.IC1Filter = 12;
+  sConfig.IC1Filter = 0;
   sConfig.IC2Polarity = TIM_ICPOLARITY_RISING;
   sConfig.IC2Selection = TIM_ICSELECTION_DIRECTTI;
   sConfig.IC2Prescaler = TIM_ICPSC_DIV1;
@@ -376,11 +424,11 @@ static void MX_TIM4_Init(void)
   htim4.Init.Period = 65535;
   htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim4.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  sConfig.EncoderMode = TIM_ENCODERMODE_TI12;
+  sConfig.EncoderMode = TIM_ENCODERMODE_TI1;
   sConfig.IC1Polarity = TIM_ICPOLARITY_RISING;
   sConfig.IC1Selection = TIM_ICSELECTION_DIRECTTI;
   sConfig.IC1Prescaler = TIM_ICPSC_DIV1;
-  sConfig.IC1Filter = 12;
+  sConfig.IC1Filter = 0;
   sConfig.IC2Polarity = TIM_ICPOLARITY_RISING;
   sConfig.IC2Selection = TIM_ICSELECTION_DIRECTTI;
   sConfig.IC2Prescaler = TIM_ICPSC_DIV1;
@@ -494,53 +542,105 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 }
 /* USER CODE END 4 */
 
-/* USER CODE BEGIN Header_Task_Comm01 */
+/* USER CODE BEGIN Header_Comm_Task_Entry */
 /**
   * @brief  Function implementing the Task_Comm thread.
   * @param  argument: Not used
   * @retval None
   */
-/* USER CODE END Header_Task_Comm01 */
-void Task_Comm01(void *argument)
+/* USER CODE END Header_Comm_Task_Entry */
+void Comm_Task_Entry(void *argument)
 {
   /* USER CODE BEGIN 5 */
+	
+  /* Infinite loop */
+  for(;;)
+  {
+        osDelay(1);
+  }
+  /* USER CODE END 5 */
+}
+
+/* USER CODE BEGIN Header_Chassis_Task_Entry */
+/**
+* @brief Function implementing the Task_Chassis thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_Chassis_Task_Entry */
+void Chassis_Task_Entry(void *argument)
+{
+  /* USER CODE BEGIN Chassis_Task_Entry */
+	Odometry_Init();
+  Chassis_Init();
+  Encoder_Init();
+  
+  // 保持你刚才测试成功的强力参数！千万别改回去了！
+  PID_Init(&PID_MotorL, 80.0f, 0.5f, 0.0f, 7199.0f, 4000.0f);
+  PID_Init(&PID_MotorR, 80.0f, 0.5f, 0.0f, 7199.0f, 4000.0f);
+
+  Kinematics_Motor_Speed_t target_speed_mps;
+  Kinematics_Motor_Pulse_t target_pulse;
+  int min_startup_pwm = 1500; // 保持这个低保值
+
+  for(;;)
+  {
+    // 1. 获取真实指令
+    float test_linear_x = User_Target_Linear_X; 
+    float test_angular_z = User_Target_Angular_Z;
+
+    // 2. 解算
+    target_speed_mps = Kinematics_Inverse(test_linear_x, test_angular_z);
+    target_pulse = Kinematics_SpeedToPulse(target_speed_mps, 0.05f);
+
+    // 3. 反馈与PID
+    float current_pulse_L = (float)Read_Encoder_Motor1();
+    float current_pulse_R = (float)Read_Encoder_Motor2();
+    float pwm_L = PID_Compute(&PID_MotorL, target_pulse.left_ticks, current_pulse_L);
+    float pwm_R = PID_Compute(&PID_MotorR, target_pulse.right_ticks, current_pulse_R);
+
+    // 4. 安全停车 (如果目标是0，强制关断)
+    if (fabs(test_linear_x) < 0.01f && fabs(test_angular_z) < 0.01f) {
+        pwm_L = 0;
+        pwm_R = 0;
+        PID_MotorL.Sum_Error = 0; // 清积分
+        PID_MotorR.Sum_Error = 0;
+    }
+    else {
+        // 5. 起步低保 (只有在目标不为0时才给)
+        // 左轮
+        if (pwm_L > 0 && pwm_L < min_startup_pwm) pwm_L = min_startup_pwm;
+        else if (pwm_L < 0 && pwm_L > -min_startup_pwm) pwm_L = -min_startup_pwm;
+        // 右轮
+        if (pwm_R > 0 && pwm_R < min_startup_pwm) pwm_R = min_startup_pwm;
+        else if (pwm_R < 0 && pwm_R > -min_startup_pwm) pwm_R = -min_startup_pwm;
+    }
+
+    // 6. 输出
+    Motor1_SetSpeed((int)pwm_L);
+    Motor2_SetSpeed((int)pwm_R);
+
+    osDelay(50);
+  }
+  /* USER CODE END Chassis_Task_Entry */
+}
+
+/* USER CODE BEGIN Header_System_Task_Entry */
+/**
+* @brief Function implementing the Task_System thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_System_Task_Entry */
+void System_Task_Entry(void *argument)
+{
+  /* USER CODE BEGIN System_Task_Entry */
   /* Infinite loop */
   for(;;)
   {
     osDelay(1);
   }
-  /* USER CODE END 5 */
-}
-
-/* USER CODE BEGIN Header_Tack_Motor00 */
-/**
-* @brief Function implementing the Tack_Motor thread.
-* @param argument: Not used
-* @retval None
-*/
-/* USER CODE END Header_Tack_Motor00 */
-void Tack_Motor00(void *argument)
-{
-  /* USER CODE BEGIN Tack_Motor00 */
-  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
-  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
-  /* Infinite loop */
-  for(;;)
-  {
-	// 1. 获取编码器速度
-      // A. 设置方向 (GPIO引脚请根据你 motor.h 里的实际定义修改)
-      // 假设这是左轮 (请确认你的 AIN1/AIN2 是哪两个脚)
-      HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);   // AIN1
-      HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_RESET); // AIN2
-      
-      // B. 直接给 PWM (满载的 50% 左右，足以驱动)
-      // 假设你的 ARR 是 7199，给 3000 就很有力了
-      __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, 3000); 
-
-      // C. 延时观察
-      osDelay(100);
-  }
-  /* USER CODE END Tack_Motor00 */
+  /* USER CODE END System_Task_Entry */
 }
 
 /**
